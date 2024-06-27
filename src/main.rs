@@ -24,6 +24,12 @@ struct Opt {
 
     #[structopt(long)]
     table_name: String,
+
+    #[structopt(long, default_value = "AA00")]
+    starting_plane_id: String,
+
+    #[structopt(long)]
+    quiet: bool,
 }
 
 #[derive(Clone)]
@@ -68,15 +74,10 @@ impl PlaneData {
     }
 }
 
-fn generate_plane_id(n: u32) -> String {
-    let letters = ((n / 1000) as u8, ((n / 100) % 10) as u8);
-    let digits = n % 100;
-    format!(
-        "{}{}{:02}",
-        (letters.0 + b'A') as char,
-        (letters.1 + b'A') as char,
-        digits
-    )
+fn generate_plane_id(starting_id: &str, n: u32) -> String {
+    let letters = &starting_id[..2];
+    let digits = starting_id[2..].parse::<u32>().unwrap() + n;
+    format!("{}{:02}", letters, digits)
 }
 
 async fn generate_data(
@@ -86,6 +87,7 @@ async fn generate_data(
     total_rows: Arc<AtomicU64>,
     sem: Arc<Semaphore>,
     table_name: Arc<String>,
+    quiet: bool,
 ) {
     let mut plane_data = PlaneData::new(plane_id);
     let mut interval = interval(Duration::from_millis(1000 / rate));
@@ -115,17 +117,19 @@ async fn generate_data(
             .at(TimestampNanos::new(plane_data.timestamp)).unwrap();
 
         let mut sender = sender.lock().await;
-        match sender.flush(&mut buffer) {
-            Ok(_) => println!("Successfully flushed buffer for plane {} with {} rows", plane_data.plane_id, rows_generated),
-            Err(e) => eprintln!("Failed to flush buffer for plane {}: {}", plane_data.plane_id, e),
-        }
-
-        if rows_generated % 1000 == 0 {
-            println!("Plane {} generated {} rows so far. Total remaining rows: {}", plane_data.plane_id, rows_generated, total_rows.load(Ordering::SeqCst));
+        if !quiet {
+            match sender.flush(&mut buffer) {
+                Ok(_) => println!("Successfully flushed buffer for plane {} with {} rows", plane_data.plane_id, rows_generated),
+                Err(e) => eprintln!("Failed to flush buffer for plane {}: {}", plane_data.plane_id, e),
+            }
+        } else {
+            let _ = sender.flush(&mut buffer);
         }
     }
 
-    println!("Plane {} generated {} rows.", plane_data.plane_id, rows_generated);
+    if !quiet {
+        println!("Plane {} generated {} rows.", plane_data.plane_id, rows_generated);
+    }
 }
 
 #[tokio::main]
@@ -139,6 +143,8 @@ async fn main() {
     let plane_count = opt.plane_count;
     let sem = Arc::new(Semaphore::new(plane_count as usize * rate_per_plane as usize));
     let table_name = Arc::new(opt.table_name.clone());
+    let starting_plane_id = opt.starting_plane_id.clone();
+    let quiet = opt.quiet;
 
     let mut tasks = vec![];
 
@@ -147,8 +153,8 @@ async fn main() {
         let total_rows = total_rows.clone();
         let sem = sem.clone();
         let table_name = table_name.clone();
-        let plane_id_str = generate_plane_id(plane_id);
-        tasks.push(tokio::spawn(generate_data(sender, plane_id_str, rate_per_plane, total_rows, sem, table_name)));
+        let plane_id_str = generate_plane_id(&starting_plane_id, plane_id);
+        tasks.push(tokio::spawn(generate_data(sender, plane_id_str, rate_per_plane, total_rows, sem, table_name, quiet)));
     }
 
     join_all(tasks).await;
