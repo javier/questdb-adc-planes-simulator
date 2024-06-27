@@ -97,7 +97,8 @@ async fn generate_data(
     batch_size: usize, // Batch size per plane
 ) {
     let mut plane_data = PlaneData::new(plane_id);
-    let mut interval = interval(Duration::from_millis(1000 / rate));
+    let interval_duration = if rate > 0 { 1000 / rate } else { 1 }; // Set minimum interval duration to 1 ms
+    let mut interval = interval(Duration::from_millis(interval_duration));
     let mut rows_generated = 0;
     let mut buffer = Buffer::new();
 
@@ -110,6 +111,7 @@ async fn generate_data(
 
         plane_data.update();
         rows_generated += 1;
+        let remaining_rows = total_rows.fetch_sub(1, Ordering::SeqCst);
 
         buffer.table(table_name.as_str()).unwrap()
             .symbol("plane_id", &plane_data.plane_id).unwrap()
@@ -122,14 +124,8 @@ async fn generate_data(
             .column_f64("oat", plane_data.oat).unwrap()
             .at(TimestampNanos::new(plane_data.timestamp)).unwrap();
 
-        // Decrement the total_rows only when we have successfully added to the buffer
-        let remaining_rows = total_rows.fetch_sub(1, Ordering::SeqCst);
-        if remaining_rows == 0 {
-            break;
-        }
-
-        // Flush buffer when batch size is reached
-        if rows_generated % batch_size == 0 {
+        // Flush buffer when batch size is reached or if it's the last batch
+        if rows_generated % batch_size == 0 || remaining_rows == 1 {
             let _permit = sem.acquire().await.unwrap();
             let mut sender = sender.lock().await;
             if !quiet {
@@ -140,6 +136,10 @@ async fn generate_data(
             } else {
                 let _ = sender.flush(&mut buffer);
             }
+        }
+
+        if remaining_rows == 1 {
+            break;
         }
     }
 
