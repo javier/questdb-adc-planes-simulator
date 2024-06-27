@@ -1,0 +1,16 @@
+[package]
+name = "airplanes"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+chrono = "0.4"
+rand = "0.8"
+tokio = { version = "1", features = ["full"] }
+questdb-rs = "4.0.2"
+structopt = "0.3"
+futures = "0.3"  # Add this line
+
+[[bin]]
+name = "airplanes"
+path = "src/main.rs"
