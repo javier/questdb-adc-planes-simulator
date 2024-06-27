@@ -80,40 +80,52 @@ fn generate_plane_id(n: u32) -> String {
 }
 
 async fn generate_data(
-    sender: Arc<tokio::sync::Mutex<Sender>>,  // Use Mutex to allow mutable access
+    sender: Arc<tokio::sync::Mutex<Sender>>,
     plane_id: String,
     rate: u64,
     total_rows: Arc<AtomicU64>,
     sem: Arc<Semaphore>,
-    table_name: String,
+    table_name: Arc<String>,
 ) {
     let mut plane_data = PlaneData::new(plane_id);
     let mut interval = interval(Duration::from_millis(1000 / rate));
+    let mut rows_generated = 0;
 
-    while total_rows.fetch_sub(1, Ordering::SeqCst) > 0 {
+    while total_rows.load(Ordering::SeqCst) > 0 {
         interval.tick().await;
+
+        if total_rows.fetch_sub(1, Ordering::SeqCst) == 0 {
+            break;
+        }
+
         plane_data.update();
+        rows_generated += 1;
 
         let _permit = sem.acquire().await.unwrap();
-        let sender = sender.clone();
-        let plane_data_copy = plane_data.clone();  // Use a copy of plane_data to avoid move
-        let table_name_copy = table_name.clone();  // Use a copy of table_name to avoid move
-        tokio::spawn(async move {
-            let mut buffer = Buffer::new();
-            buffer.table(&table_name_copy as &str).unwrap()  // Convert &String to &str
-                .symbol("plane_id", &plane_data_copy.plane_id).unwrap()
-                .column_f64("airspeed", plane_data_copy.airspeed).unwrap()
-                .column_f64("altitude", plane_data_copy.altitude).unwrap()
-                .column_f64("pitch", plane_data_copy.pitch).unwrap()
-                .column_f64("roll", plane_data_copy.roll).unwrap()
-                .column_f64("yaw", plane_data_copy.yaw).unwrap()
-                .column_f64("aoa", plane_data_copy.aoa).unwrap()
-                .column_f64("oat", plane_data_copy.oat).unwrap()
-                .at(TimestampNanos::new(plane_data_copy.timestamp)).unwrap();
-            let mut sender = sender.lock().await;  // Lock the sender for mutable access
-            sender.flush(&mut buffer).unwrap();
-        });
+        let mut buffer = Buffer::new();
+        buffer.table(&table_name as &str).unwrap()
+            .symbol("plane_id", &plane_data.plane_id).unwrap()
+            .column_f64("airspeed", plane_data.airspeed).unwrap()
+            .column_f64("altitude", plane_data.altitude).unwrap()
+            .column_f64("pitch", plane_data.pitch).unwrap()
+            .column_f64("roll", plane_data.roll).unwrap()
+            .column_f64("yaw", plane_data.yaw).unwrap()
+            .column_f64("aoa", plane_data.aoa).unwrap()
+            .column_f64("oat", plane_data.oat).unwrap()
+            .at(TimestampNanos::new(plane_data.timestamp)).unwrap();
+
+        let mut sender = sender.lock().await;
+        match sender.flush(&mut buffer) {
+            Ok(_) => println!("Successfully flushed buffer for plane {} with {} rows", plane_data.plane_id, rows_generated),
+            Err(e) => eprintln!("Failed to flush buffer for plane {}: {}", plane_data.plane_id, e),
+        }
+
+        if rows_generated % 1000 == 0 {
+            println!("Plane {} generated {} rows so far. Total remaining rows: {}", plane_data.plane_id, rows_generated, total_rows.load(Ordering::SeqCst));
+        }
     }
+
+    println!("Plane {} generated {} rows.", plane_data.plane_id, rows_generated);
 }
 
 #[tokio::main]
@@ -125,7 +137,8 @@ async fn main() {
     let total_rows = Arc::new(AtomicU64::new(opt.total_rows));
     let rate_per_plane = opt.rate_per_plane;
     let plane_count = opt.plane_count;
-    let sem = Arc::new(Semaphore::new((plane_count as u64 * rate_per_plane) as usize));
+    let sem = Arc::new(Semaphore::new(plane_count as usize * rate_per_plane as usize));
+    let table_name = Arc::new(opt.table_name.clone());
 
     let mut tasks = vec![];
 
@@ -133,10 +146,13 @@ async fn main() {
         let sender = sender.clone();
         let total_rows = total_rows.clone();
         let sem = sem.clone();
-        let table_name = opt.table_name.clone();
+        let table_name = table_name.clone();
         let plane_id_str = generate_plane_id(plane_id);
         tasks.push(tokio::spawn(generate_data(sender, plane_id_str, rate_per_plane, total_rows, sem, table_name)));
     }
 
     join_all(tasks).await;
+
+    let generated_rows = opt.total_rows - total_rows.load(Ordering::SeqCst);
+    println!("Data generation completed. Total rows generated: {}", generated_rows);
 }
