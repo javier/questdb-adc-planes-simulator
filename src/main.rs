@@ -3,7 +3,10 @@ use rand::Rng;
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, interval};
-use questdb::ingress::{Sender, Buffer, TimestampNanos};
+use questdb::{
+    Result,
+    ingress::{Sender, Buffer, TimestampNanos}
+};
 use structopt::StructOpt;
 use futures::future::join_all;
 
@@ -30,6 +33,9 @@ struct Opt {
 
     #[structopt(long)]
     quiet: bool,
+
+    #[structopt(long, default_value = "1000")]
+    batch_size: usize,
 }
 
 #[derive(Clone)]
@@ -88,24 +94,24 @@ async fn generate_data(
     sem: Arc<Semaphore>,
     table_name: Arc<String>,
     quiet: bool,
+    batch_size: usize, // Batch size per plane
 ) {
     let mut plane_data = PlaneData::new(plane_id);
     let mut interval = interval(Duration::from_millis(1000 / rate));
     let mut rows_generated = 0;
+    let mut buffer = Buffer::new();
 
-    while total_rows.load(Ordering::SeqCst) > 0 {
+    loop {
         interval.tick().await;
 
-        if total_rows.fetch_sub(1, Ordering::SeqCst) == 0 {
+        if total_rows.load(Ordering::SeqCst) == 0 {
             break;
         }
 
         plane_data.update();
         rows_generated += 1;
 
-        let _permit = sem.acquire().await.unwrap();
-        let mut buffer = Buffer::new();
-        buffer.table(&table_name as &str).unwrap()
+        buffer.table(table_name.as_str()).unwrap()
             .symbol("plane_id", &plane_data.plane_id).unwrap()
             .column_f64("airspeed", plane_data.airspeed).unwrap()
             .column_f64("altitude", plane_data.altitude).unwrap()
@@ -116,15 +122,32 @@ async fn generate_data(
             .column_f64("oat", plane_data.oat).unwrap()
             .at(TimestampNanos::new(plane_data.timestamp)).unwrap();
 
-        let mut sender = sender.lock().await;
-        if !quiet {
-            match sender.flush(&mut buffer) {
-                Ok(_) => println!("Successfully flushed buffer for plane {} with {} rows", plane_data.plane_id, rows_generated),
-                Err(e) => eprintln!("Failed to flush buffer for plane {}: {}", plane_data.plane_id, e),
-            }
-        } else {
-            let _ = sender.flush(&mut buffer);
+        // Decrement the total_rows only when we have successfully added to the buffer
+        let remaining_rows = total_rows.fetch_sub(1, Ordering::SeqCst);
+        if remaining_rows == 0 {
+            break;
         }
+
+        // Flush buffer when batch size is reached
+        if rows_generated % batch_size == 0 {
+            let _permit = sem.acquire().await.unwrap();
+            let mut sender = sender.lock().await;
+            if !quiet {
+                match sender.flush(&mut buffer) {
+                    Ok(_) => println!("Successfully flushed buffer for plane {} with {} rows", plane_data.plane_id, rows_generated),
+                    Err(e) => eprintln!("Failed to flush buffer for plane {}: {}", plane_data.plane_id, e),
+                }
+            } else {
+                let _ = sender.flush(&mut buffer);
+            }
+        }
+    }
+
+    // Flush any remaining rows in the buffer
+    if buffer.len() > 0 {
+        let _permit = sem.acquire().await.unwrap();
+        let mut sender = sender.lock().await;
+        let _ = sender.flush(&mut buffer);
     }
 
     if !quiet {
@@ -133,18 +156,20 @@ async fn generate_data(
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let opt = Opt::from_args();
+    let connection_string = opt.connection_string.clone();
     let sender = Arc::new(
-        tokio::sync::Mutex::new(Sender::from_conf(&opt.connection_string).expect("Failed to connect to QuestDB")),
+        tokio::sync::Mutex::new(Sender::from_conf(&connection_string)?),
     );
     let total_rows = Arc::new(AtomicU64::new(opt.total_rows));
     let rate_per_plane = opt.rate_per_plane;
     let plane_count = opt.plane_count;
-    let sem = Arc::new(Semaphore::new(plane_count as usize * rate_per_plane as usize));
+    let sem = Arc::new(Semaphore::new(plane_count as usize * opt.batch_size));
     let table_name = Arc::new(opt.table_name.clone());
     let starting_plane_id = opt.starting_plane_id.clone();
     let quiet = opt.quiet;
+    let batch_size = opt.batch_size;
 
     let mut tasks = vec![];
 
@@ -154,11 +179,13 @@ async fn main() {
         let sem = sem.clone();
         let table_name = table_name.clone();
         let plane_id_str = generate_plane_id(&starting_plane_id, plane_id);
-        tasks.push(tokio::spawn(generate_data(sender, plane_id_str, rate_per_plane, total_rows, sem, table_name, quiet)));
+        tasks.push(tokio::spawn(generate_data(sender, plane_id_str, rate_per_plane, total_rows, sem, table_name, quiet, batch_size)));
     }
 
     join_all(tasks).await;
 
     let generated_rows = opt.total_rows - total_rows.load(Ordering::SeqCst);
     println!("Data generation completed. Total rows generated: {}", generated_rows);
+
+    Ok(())
 }
