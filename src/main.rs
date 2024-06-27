@@ -98,7 +98,7 @@ async fn generate_data(
 ) {
     let mut plane_data = PlaneData::new(plane_id);
     let interval_duration = if rate > 0 { 1000 / rate } else { 1 }; // Set minimum interval duration to 1 ms
-    let mut interval = interval(Duration::from_millis(interval_duration));
+    let mut interval = interval(Duration::from_millis(interval_duration.max(1)));
     let mut rows_generated = 0;
     let mut buffer = Buffer::new();
 
